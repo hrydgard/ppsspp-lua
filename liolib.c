@@ -21,7 +21,8 @@
 
 #include "lauxlib.h"
 #include "lualib.h"
-#include "llimits.h"
+
+
 
 
 /*
@@ -443,7 +444,7 @@ static int nextc (RN *rn) {
     return 0;  /* fail */
   }
   else {
-    rn->buff[rn->n++] = cast_char(rn->c);  /* save current char */
+    rn->buff[rn->n++] = rn->c;  /* save current char */
     rn->c = l_getc(rn->f);  /* read next one */
     return 1;
   }
@@ -524,15 +525,15 @@ static int read_line (lua_State *L, FILE *f, int chop) {
   luaL_buffinit(L, &b);
   do {  /* may need to read several chunks to get whole line */
     char *buff = luaL_prepbuffer(&b);  /* preallocate buffer space */
-    unsigned i = 0;
+    int i = 0;
     l_lockfile(f);  /* no memory errors can happen inside the lock */
     while (i < LUAL_BUFFERSIZE && (c = l_getc(f)) != EOF && c != '\n')
-      buff[i++] = cast_char(c);  /* read up to end of line or buffer limit */
+      buff[i++] = c;  /* read up to end of line or buffer limit */
     l_unlockfile(f);
     luaL_addsize(&b, i);
   } while (c != EOF && c != '\n');  /* repeat until end of line */
   if (!chop && c == '\n')  /* want a newline and have one? */
-    luaL_addchar(&b, '\n');  /* add ending newline to result */
+    luaL_addchar(&b, c);  /* add ending newline to result */
   luaL_pushresult(&b);  /* close buffer */
   /* return ok if read something (either a newline or something else) */
   return (c == '\n' || lua_rawlen(L, -1) > 0);
@@ -665,16 +666,20 @@ static int g_write (lua_State *L, FILE *f, int arg) {
   int status = 1;
   errno = 0;
   for (; nargs--; arg++) {
-    char buff[LUA_N2SBUFFSZ];
-    const char *s;
-    size_t len = lua_numbertostrbuff(L, arg, buff);  /* try as a number */
-    if (len > 0) {  /* did conversion work (value was a number)? */
-      s = buff;
-      len--;
+    if (lua_type(L, arg) == LUA_TNUMBER) {
+      /* optimization: could be done exactly as for strings */
+      int len = lua_isinteger(L, arg)
+                ? fprintf(f, LUA_INTEGER_FMT,
+                             (LUAI_UACINT)lua_tointeger(L, arg))
+                : fprintf(f, LUA_NUMBER_FMT,
+                             (LUAI_UACNUMBER)lua_tonumber(L, arg));
+      status = status && (len > 0);
     }
-    else  /* must be a string */
-      s = luaL_checklstring(L, arg, &len);
-    status = status && (fwrite(s, sizeof(char), len, f) == len);
+    else {
+      size_t l;
+      const char *s = luaL_checklstring(L, arg, &l);
+      status = status && (fwrite(s, sizeof(char), l, f) == l);
+    }
   }
   if (l_likely(status))
     return 1;  /* file handle already on stack top */

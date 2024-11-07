@@ -16,24 +16,20 @@
 
 
 /*
-** 'l_mem' is a signed integer big enough to count the total memory
-** used by Lua.  (It is signed due to the use of debt in several
-** computations.)  Usually, 'ptrdiff_t' should work, but we use 'long'
-** for 16-bit machines.
+** 'lu_mem' and 'l_mem' are unsigned/signed integers big enough to count
+** the total memory used by Lua (in bytes). Usually, 'size_t' and
+** 'ptrdiff_t' should work, but we use 'long' for 16-bit machines.
 */
 #if defined(LUAI_MEM)		/* { external definitions? */
-typedef LUAI_MEM l_mem;
 typedef LUAI_UMEM lu_mem;
+typedef LUAI_MEM l_mem;
 #elif LUAI_IS32INT	/* }{ */
-typedef ptrdiff_t l_mem;
 typedef size_t lu_mem;
+typedef ptrdiff_t l_mem;
 #else  /* 16-bit ints */	/* }{ */
-typedef long l_mem;
 typedef unsigned long lu_mem;
+typedef long l_mem;
 #endif				/* } */
-
-#define MAX_LMEM  \
-	cast(l_mem, (cast(lu_mem, 1) << (sizeof(l_mem) * 8 - 1)) - 1)
 
 
 /* chars used as small naturals (so that 'char' is reserved for characters) */
@@ -44,18 +40,24 @@ typedef signed char ls_byte;
 /* maximum value for size_t */
 #define MAX_SIZET	((size_t)(~(size_t)0))
 
-/*
-** Maximum size for strings and userdata visible for Lua; should be
-** representable as a lua_Integer and as a size_t.
-*/
+/* maximum size visible for Lua (must be representable in a lua_Integer) */
 #define MAX_SIZE	(sizeof(size_t) < sizeof(lua_Integer) ? MAX_SIZET \
-			  : cast_sizet(LUA_MAXINTEGER))
+                          : (size_t)(LUA_MAXINTEGER))
+
+
+#define MAX_LUMEM	((lu_mem)(~(lu_mem)0))
+
+#define MAX_LMEM	((l_mem)(MAX_LUMEM >> 1))
+
+
+#define MAX_INT		INT_MAX  /* maximum value of an int */
+
 
 /*
 ** floor of the log2 of the maximum signed value for integral type 't'.
 ** (That is, maximum 'n' such that '2^n' fits in the given signed type.)
 */
-#define log2maxs(t)	cast_int(sizeof(t) * 8 - 2)
+#define log2maxs(t)	(sizeof(t) * 8 - 2)
 
 
 /*
@@ -86,7 +88,7 @@ typedef signed char ls_byte;
 #define L_P2I	size_t
 #endif
 
-#define point2uint(p)	cast_uint((L_P2I)(p) & UINT_MAX)
+#define point2uint(p)	((unsigned int)((L_P2I)(p) & UINT_MAX))
 
 
 
@@ -114,6 +116,15 @@ typedef LUAI_UACINT l_uacInt;
 #define lua_longassert(c)	((void)0)
 #endif
 
+/*
+** assertion for checking API calls
+*/
+#if !defined(luai_apicheck)
+#define luai_apicheck(l,e)	((void)l, lua_assert(e))
+#endif
+
+#define api_check(l,e,msg)	luai_apicheck(l,(e) && msg)
+
 
 /* macro to avoid warnings about unused variables */
 #if !defined(UNUSED)
@@ -129,7 +140,6 @@ typedef LUAI_UACINT l_uacInt;
 #define cast_num(i)	cast(lua_Number, (i))
 #define cast_int(i)	cast(int, (i))
 #define cast_uint(i)	cast(unsigned int, (i))
-#define cast_ulong(i)	cast(unsigned long, (i))
 #define cast_byte(i)	cast(lu_byte, (i))
 #define cast_uchar(i)	cast(unsigned char, (i))
 #define cast_char(i)	cast(char, (i))
@@ -150,38 +160,6 @@ typedef LUAI_UACINT l_uacInt;
 #if !defined(l_castU2S)
 #define l_castU2S(i)	((lua_Integer)(i))
 #endif
-
-/*
-** cast a size_t to lua_Integer: These casts are always valid for
-** sizes of Lua objects (see MAX_SIZE)
-*/
-#define cast_st2S(sz)	((lua_Integer)(sz))
-
-/* Cast a ptrdiff_t to size_t, when it is known that the minuend
-** comes from the subtraend (the base)
-*/
-#define ct_diff2sz(df)	((size_t)(df))
-
-/* ptrdiff_t to lua_Integer */
-#define ct_diff2S(df)	cast_st2S(ct_diff2sz(df))
-
-/*
-** Special type equivalent to '(void*)' for functions (to suppress some
-** warnings when converting function pointers)
-*/
-typedef void (*voidf)(void);
-
-/*
-** Macro to convert pointer-to-void* to pointer-to-function. This cast
-** is undefined according to ISO C, but POSIX assumes that it works.
-** (The '__extension__' in gnu compilers is only to avoid warnings.)
-*/
-#if defined(__GNUC__)
-#define cast_func(p) (__extension__ (voidf)(p))
-#else
-#define cast_func(p) ((voidf)(p))
-#endif
-
 
 
 /*
@@ -215,13 +193,115 @@ typedef void (*voidf)(void);
 
 
 /*
-** An unsigned with (at least) 4 bytes
+** type for virtual-machine instructions;
+** must be an unsigned with (at least) 4 bytes (see details in lopcodes.h)
 */
 #if LUAI_IS32INT
 typedef unsigned int l_uint32;
 #else
 typedef unsigned long l_uint32;
 #endif
+
+typedef l_uint32 Instruction;
+
+
+
+/*
+** Maximum length for short strings, that is, strings that are
+** internalized. (Cannot be smaller than reserved words or tags for
+** metamethods, as these strings must be internalized;
+** #("function") = 8, #("__newindex") = 10.)
+*/
+#if !defined(LUAI_MAXSHORTLEN)
+#define LUAI_MAXSHORTLEN	40
+#endif
+
+
+/*
+** Initial size for the string table (must be power of 2).
+** The Lua core alone registers ~50 strings (reserved words +
+** metaevent keys + a few others). Libraries would typically add
+** a few dozens more.
+*/
+#if !defined(MINSTRTABSIZE)
+#define MINSTRTABSIZE	128
+#endif
+
+
+/*
+** Size of cache for strings in the API. 'N' is the number of
+** sets (better be a prime) and "M" is the size of each set (M == 1
+** makes a direct cache.)
+*/
+#if !defined(STRCACHE_N)
+#define STRCACHE_N		53
+#define STRCACHE_M		2
+#endif
+
+
+/* minimum size for string buffer */
+#if !defined(LUA_MINBUFFER)
+#define LUA_MINBUFFER	32
+#endif
+
+
+/*
+** Maximum depth for nested C calls, syntactical nested non-terminals,
+** and other features implemented through recursion in C. (Value must
+** fit in a 16-bit unsigned integer. It must also be compatible with
+** the size of the C stack.)
+*/
+#if !defined(LUAI_MAXCCALLS)
+#define LUAI_MAXCCALLS		200
+#endif
+
+
+/*
+** macros that are executed whenever program enters the Lua core
+** ('lua_lock') and leaves the core ('lua_unlock')
+*/
+#if !defined(lua_lock)
+#define lua_lock(L)	((void) 0)
+#define lua_unlock(L)	((void) 0)
+#endif
+
+/*
+** macro executed during Lua functions at points where the
+** function can yield.
+*/
+#if !defined(luai_threadyield)
+#define luai_threadyield(L)	{lua_unlock(L); lua_lock(L);}
+#endif
+
+
+/*
+** these macros allow user-specific actions when a thread is
+** created/deleted/resumed/yielded.
+*/
+#if !defined(luai_userstateopen)
+#define luai_userstateopen(L)		((void)L)
+#endif
+
+#if !defined(luai_userstateclose)
+#define luai_userstateclose(L)		((void)L)
+#endif
+
+#if !defined(luai_userstatethread)
+#define luai_userstatethread(L,L1)	((void)L)
+#endif
+
+#if !defined(luai_userstatefree)
+#define luai_userstatefree(L,L1)	((void)L)
+#endif
+
+#if !defined(luai_userstateresume)
+#define luai_userstateresume(L,n)	((void)L)
+#endif
+
+#if !defined(luai_userstateyield)
+#define luai_userstateyield(L,n)	((void)L)
+#endif
+
 
 
 /*
@@ -276,29 +356,25 @@ typedef unsigned long l_uint32;
 #endif
 
 
+
+
+
 /*
-** {==================================================================
-** "Abstraction Layer" for basic report of messages and errors
-** ===================================================================
+** macro to control inclusion of some hard tests on stack reallocation
 */
-
-/* print a string */
-#if !defined(lua_writestring)
-#define lua_writestring(s,l)   fwrite((s), sizeof(char), (l), stdout)
+#if !defined(HARDSTACKTESTS)
+#define condmovestack(L,pre,pos)	((void)0)
+#else
+/* realloc stack keeping its size */
+#define condmovestack(L,pre,pos)  \
+  { int sz_ = stacksize(L); pre; luaD_reallocstack((L), sz_, 0); pos; }
 #endif
 
-/* print a newline and flush the output */
-#if !defined(lua_writeline)
-#define lua_writeline()        (lua_writestring("\n", 1), fflush(stdout))
+#if !defined(HARDMEMTESTS)
+#define condchangemem(L,pre,pos)	((void)0)
+#else
+#define condchangemem(L,pre,pos)  \
+	{ if (gcrunning(G(L))) { pre; luaC_fullgc(L, 0); pos; } }
 #endif
 
-/* print an error message */
-#if !defined(lua_writestringerror)
-#define lua_writestringerror(s,p) \
-        (fprintf(stderr, (s), (p)), fflush(stderr))
 #endif
-
-/* }================================================================== */
-
-#endif
-
